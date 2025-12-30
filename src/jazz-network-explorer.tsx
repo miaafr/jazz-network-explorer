@@ -1,4 +1,4 @@
-// jazz_network_explorer_netlify_hybrid.tsx
+// jazz_egonet_explorer_netlify_hybrid.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 
@@ -98,6 +98,7 @@ function displayStrength(e: Pick<EdgeDatum, "w_instr" | "w_credit">, mode: Evide
   return e.w_instr + e.w_credit;
 }
 
+// Used ONLY for shortest-path weighting (favor performer links when both are allowed)
 function costStrength(e: Pick<EdgeDatum, "w_instr" | "w_credit">, mode: EvidenceMode): number {
   if (mode === "instr") return e.w_instr;
   if (mode === "credit") return e.w_credit;
@@ -169,6 +170,7 @@ function shortestPath(
   for (const e of edges) {
     if (!edgeAllowed(e, mode, minWeight)) continue;
     const s = costStrength(e, mode);
+    // lower cost for stronger ties; add hopPenalty to avoid super-long weak paths
     const cost = 1 / (s + 1) + hopPenalty;
     adj.get(e.source)?.push({ to: e.target, cost });
     adj.get(e.target)?.push({ to: e.source, cost });
@@ -383,9 +385,6 @@ export default function JazzNetworkExplorer() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  // Zoom: transform the inner <g>, keep simulation coords stable
-  const zoomGRef = useRef<SVGGElement | null>(null);
-
   // Tooltip/hover are handled imperatively to avoid rerenders & sim restarts on hover/move.
   const tooltipRef = useRef<HTMLDivElement | null>(null);
   const hoverEdgeRef = useRef<EdgeDatum | null>(null);
@@ -451,6 +450,35 @@ export default function JazzNetworkExplorer() {
   const egonetMatches = useMemo(() => topMatches(nodesSorted, egonetQuery, 12), [nodesSorted, egonetQuery]);
   const startMatches = useMemo(() => topMatches(nodesSorted, startQuery, 12), [nodesSorted, startQuery]);
   const endMatches = useMemo(() => topMatches(nodesSorted, endQuery, 12), [nodesSorted, endQuery]);
+
+  // Auto-load default GraphML from public/network_dual.graphml on startup (if present),
+  // but NEVER overwrite once something is already loaded.
+  useEffect(() => {
+    if (allNodes.length > 0) return;
+
+    fetch("/network_dual.graphml")
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
+      .then((text) => {
+        const { nodes, edges } = parseGraphML(text);
+        setAllNodes(nodes);
+        setAllEdges(edges);
+
+        const byName = new Map(nodes.map((n) => [normalize(n.name), n.id]));
+        const miles = byName.get("miles davis");
+        const trane = byName.get("john coltrane");
+        const fallback = nodes[0]?.id || "";
+
+        setFocusId(miles || fallback);
+        setStartId(miles || fallback);
+        setEndId(trane || fallback);
+      })
+      .catch(() => {
+        // Silent: if file doesn't exist, user can upload manually.
+      });
+  }, [allNodes.length]);
 
   useEffect(() => {
     if (!allNodes.length) return;
@@ -520,7 +548,6 @@ export default function JazzNetworkExplorer() {
 
     // Outer group that receives zoom transforms:
     const zoomG = sel.append("g").attr("class", "zoom-layer");
-    zoomGRef.current = zoomG.node();
 
     // Setup zoom behavior on the svg:
     const zoom = d3
@@ -532,7 +559,7 @@ export default function JazzNetworkExplorer() {
 
     sel.call(zoom as any);
 
-    // Optional: double-click to reset zoom
+    // double-click resets zoom
     sel.on("dblclick.zoom", null);
     sel.on("dblclick", () => {
       sel.transition().duration(200).call((zoom as any).transform, d3.zoomIdentity);
@@ -619,25 +646,17 @@ export default function JazzNetworkExplorer() {
         hideTooltip();
       });
 
+    const focus = viewMode === "egonet" ? focusId : startId;
+
     const node = gNodes
       .selectAll("circle")
       .data(simNodes)
       .enter()
       .append("circle")
       .attr("class", "node")
-      .attr("r", (d) => {
-        const focus = viewMode === "egonet" ? focusId : startId;
-        return d.id === focus ? 13 : 10;
-      })
-      // Color focus node differently (still in "no explicit color scheme" spirit: just use a neutral accent)
-      .attr("fill", (d) => {
-        const focus = viewMode === "egonet" ? focusId : startId;
-        return d.id === focus ? "#0b5" : "currentColor";
-      })
-      .attr("fill-opacity", (d) => {
-        const focus = viewMode === "egonet" ? focusId : startId;
-        return d.id === focus ? 0.95 : 0.85;
-      });
+      .attr("r", (d) => (d.id === focus ? 13 : 10))
+      .attr("fill", (d) => (d.id === focus ? "#0b5" : "currentColor"))
+      .attr("fill-opacity", (d) => (d.id === focus ? 0.95 : 0.85));
 
     const label = gNodes
       .selectAll("text")
@@ -649,15 +668,9 @@ export default function JazzNetworkExplorer() {
       .attr("font-size", 11)
       .attr("dominant-baseline", "middle")
       .attr("text-anchor", "start")
-      .attr("dx", (d) => {
-        const focus = viewMode === "egonet" ? focusId : startId;
-        return d.id === focus ? 16 : 14;
-      })
+      .attr("dx", (d) => (d.id === focus ? 16 : 14))
       .attr("dy", 0)
-      .attr("fill", (d) => {
-        const focus = viewMode === "egonet" ? focusId : startId;
-        return d.id === focus ? "#0b5" : "currentColor";
-      })
+      .attr("fill", (d) => (d.id === focus ? "#0b5" : "currentColor"))
       .attr("fill-opacity", 0.9);
 
     node
@@ -673,13 +686,11 @@ export default function JazzNetworkExplorer() {
         if (!hoverEdgeRef.current) hideTooltip();
       });
 
-    // Drag: pause zoom while dragging, so the interaction feels right.
+    // Drag: stop propagation so zoom doesn't treat it as pan.
     const drag = d3
       .drag<SVGCircleElement, SimNode>()
       .on("start", (event, d) => {
-        // prevent zoom from also interpreting the drag
         (event.sourceEvent as any)?.stopPropagation?.();
-
         if (!event.active) sim.alphaTarget(0.3).restart();
         d.fx = d.x;
         d.fy = d.y;
@@ -725,8 +736,8 @@ export default function JazzNetworkExplorer() {
         const byName = new Map(nodes.map((n) => [normalize(n.name), n.id]));
         const miles = byName.get("miles davis");
         const trane = byName.get("john coltrane");
-
         const fallback = nodes[0]?.id || "";
+
         setFocusId(miles || fallback);
         setStartId(miles || fallback);
         setEndId(trane || fallback);
@@ -1001,7 +1012,7 @@ export default function JazzNetworkExplorer() {
               ) : null}
             </>
           ) : (
-            <div style={{ fontSize: 13, opacity: 0.85 }}>Upload your GraphML to begin.</div>
+            <div style={{ fontSize: 13, opacity: 0.85 }}>Upload your GraphML, or add public/network_dual.graphml to auto-load.</div>
           )}
         </div>
 
